@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chumsky = "0.10.1"
 etcetera = "0.8.0"
 gouqi = "0.9.0"
 log = "0.4.22"
