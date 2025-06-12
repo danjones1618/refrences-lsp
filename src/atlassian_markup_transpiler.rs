@@ -1,7 +1,7 @@
-use chumsky::prelude::*;
+use chumsky::{prelude::*, text::digits};
 use regex::RegexBuilder;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum MarkUpNode<'a> {
     PlainText(&'a str),
     Heading1(&'a str),
@@ -152,11 +152,62 @@ fn build_atlassian_markup_heading_parser<'a>() -> impl Parser<'a, &'a str, MarkU
         .map(|(heading_ast_fn, heading_content)| heading_ast_fn(heading_content))
 }
 
+enum CodeBlockOption<'a> {
+    Title(&'a str),
+    LineNumbers(bool),
+    Language(&'a str),
+    FirstLine(u64),
+    Collapse(bool),
+}
+
 fn build_code_block_parser<'a>() -> impl Parser<'a, &'a str, MarkUpNode<'a>> {
-    let bool_parser = choice((just("true").to(true), just("false").to(false)));
-    let title_parser = just("title=").ignore_then(none_of("|}"));
-    let argument_parser = None;
-    let parser = just("{code").then(choice(just("}")));
+    let bool_parser = just("true")
+        .or(just("false"))
+        .from_str::<bool>()
+        .unwrapped();
+    // let nubmer_parser = any().filter(|c: &char| c.is_ascii_digit());
+    let arguments_parser = just(":").ignore_then(
+        choice((
+            just("title=")
+                .ignore_then(none_of("|").repeated().to_slice())
+                .map(|v| CodeBlockOption::Title(v)),
+            just("linenumbers=")
+                .ignore_then(bool_parser)
+                .map(|v| CodeBlockOption::LineNumbers(v)),
+            just("language=")
+                .ignore_then(text::ident())
+                .map(|v| CodeBlockOption::Language(v)),
+            just("firstline=")
+                .ignore_then(digits(10).to_slice().from_str::<u64>().unwrapped())
+                .map(|v| CodeBlockOption::FirstLine(v)),
+            just("collapse=")
+                .ignore_then(bool_parser)
+                .map(|v| CodeBlockOption::Collapse(v)),
+        ))
+        .boxed()
+        .separated_by(just("|"))
+        .collect::<Vec<CodeBlockOption>>(),
+    );
+
+    let code_body = just("}")
+        .padded()
+        .ignore_then(any().and_is(just("{code}").not()).repeated().to_slice())
+        .then_ignore(just("{code}").padded());
+
+    just("{code")
+        .ignore_then(arguments_parser.or_not())
+        .then(code_body)
+        .map(|(opts, inp)| MarkUpNode::CodeBlock {
+            language: opts
+                .map(|vs| {
+                    vs.iter().find_map(|f| match *f {
+                        CodeBlockOption::Language(lang) => Some(lang),
+                        _ => None,
+                    })
+                })
+                .flatten(),
+            content: inp,
+        })
 }
 
 fn build_atlassian_markup_parser<'a>() -> impl Parser<'a, &'a str, Vec<MarkUpNode<'a>>> {
@@ -235,9 +286,65 @@ mod tests {
 
     #[test]
     fn parse_codeblock_all_params() {
-        let markup = "{code:title=This is my title|linenumbers=true|language=javascript|firstline=0001|collapse=true}
+        let markup = "{code:title=This is my title|linenumbers=true|language=python|firstline=0001|collapse=true}
 This is my code
 {code}
 ";
+        let parsed = build_code_block_parser().parse(markup).unwrap();
+        assert_eq!(
+            parsed,
+            MarkUpNode::CodeBlock {
+                language: Some("python"),
+                content: "This is my code\n",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_codeblock_with_title_language() {
+        let markup = "{code:title=This|language=python}
+This is my code
+{code}
+";
+        let parsed = build_code_block_parser().parse(markup).unwrap();
+        assert_eq!(
+            parsed,
+            MarkUpNode::CodeBlock {
+                language: Some("python"),
+                content: "This is my code\n",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_codeblock_with_language() {
+        let markup = "{code:language=python}
+This is my code
+{code}
+";
+        let parsed = build_code_block_parser().parse(markup).unwrap();
+        assert_eq!(
+            parsed,
+            MarkUpNode::CodeBlock {
+                language: Some("python"),
+                content: "This is my code\n",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_codeblock_no_params() {
+        let markup = "{code}
+This is my code
+{code}
+";
+        let parsed = build_code_block_parser().parse(markup).unwrap();
+        assert_eq!(
+            parsed,
+            MarkUpNode::CodeBlock {
+                language: None,
+                content: "This is my code\n",
+            }
+        );
     }
 }
