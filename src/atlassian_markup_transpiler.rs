@@ -1,5 +1,27 @@
+use std::collections::HashMap;
+
 use chumsky::{prelude::*, text::digits};
+use lsp_types::MarkupKind;
 use regex::RegexBuilder;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum AdmotionKind {
+    Info,
+    Tip,
+    Warning,
+    Note,
+}
+
+impl AdmotionKind {
+    fn aatlassian_markup_keyword(&self) -> &'static str {
+        match self {
+            AdmotionKind::Info => "info",
+            AdmotionKind::Tip => "tip",
+            AdmotionKind::Warning => "warning",
+            AdmotionKind::Note => "note",
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum MarkUpNode<'a> {
@@ -12,6 +34,12 @@ pub enum MarkUpNode<'a> {
     Heading6(&'a str),
     CodeBlock {
         language: Option<&'a str>,
+        content: &'a str,
+    },
+    Admotion {
+        kind: AdmotionKind,
+        title: Option<&'a str>,
+        show_icon: bool,
         content: &'a str,
     },
 }
@@ -29,6 +57,12 @@ impl<'a> MarkUpNode<'a> {
             MarkUpNode::CodeBlock { language, content } => {
                 format!("```{}\n{}\n```", language.unwrap_or(""), content)
             }
+            MarkUpNode::Admotion {
+                kind,
+                title,
+                show_icon,
+                content,
+            } => todo!("Output admition markdown"),
         }
     }
 
@@ -68,11 +102,29 @@ impl<'a> MarkUpNode<'a> {
                 target.push_str(content);
                 target.push_str("```");
             }
+            MarkUpNode::Admotion {
+                kind,
+                title,
+                show_icon: _,
+                content,
+            } => {
+                match kind {
+                    AdmotionKind::Info => target.push_str("> [!INFO]"),
+                    AdmotionKind::Tip => target.push_str("> [!TIP]"),
+                    AdmotionKind::Warning => target.push_str("> [!WARNING]"),
+                    AdmotionKind::Note => target.push_str("> [!NOTE]"),
+                };
+                if let Some(title) = title {
+                    target.push_str("**");
+                    target.push_str(&title);
+                    target.push_str("**");
+                }
+                target.push_str(&content);
+            }
         }
         target.push_str("\n");
     }
 }
-
 
 fn heading_ast_node_from_count<'a>(count: u32) -> impl Fn(&'a str) -> MarkUpNode<'a> {
     match count {
@@ -157,6 +209,67 @@ fn build_code_block_parser<'a>() -> impl Parser<'a, &'a str, MarkUpNode<'a>> {
         })
 }
 
+enum AdmotionOption<'a> {
+    Title(&'a str),
+    ShowIcon(bool),
+}
+
+fn build_admotion_parser<'a>(
+    admotion_kind: AdmotionKind,
+) -> impl Parser<'a, &'a str, MarkUpNode<'a>, extra::Err<Rich<'a, char>>> {
+    let title_parser = just("title=")
+        .ignore_then(none_of("|}").repeated().to_slice())
+        .map(AdmotionOption::Title);
+
+    let show_icon_parser = just("show_icon=")
+        .ignore_then(just("true").to(true).or(just("false").to(false)))
+        .map(AdmotionOption::ShowIcon);
+
+    let ops_parser = just(":").ignore_then(
+        title_parser
+            .or(show_icon_parser)
+            .separated_by(just("|"))
+            .collect::<Vec<AdmotionOption<'a>>>(),
+    );
+
+    let tag_prefix = just("{").then(just(admotion_kind.aatlassian_markup_keyword()));
+    let start_tag = tag_prefix
+        .ignore_then(ops_parser.or_not())
+        .then_ignore(just("}"))
+        .boxed();
+    let end_tag = tag_prefix.then(just("}"));
+    let code_content = any().and_is(end_tag.not()).repeated().to_slice();
+
+    start_tag
+        .padded()
+        .then(code_content)
+        .then_ignore(end_tag)
+        .map(move |(ops, content)| MarkUpNode::Admotion {
+            kind: admotion_kind,
+            title: ops
+                .as_ref()
+                .map(|ops_vs| {
+                    ops_vs.iter().find_map(|x| match x {
+                        AdmotionOption::Title(title) => Some(*title),
+                        _ => None,
+                    })
+                })
+                .flatten()
+                .to_owned(),
+            show_icon: ops
+                .as_ref()
+                .map(|ops_vs| {
+                    ops_vs.iter().find_map(|x| match x {
+                        AdmotionOption::ShowIcon(v) => Some(*v),
+                        _ => None,
+                    })
+                })
+                .flatten()
+                .unwrap_or(true),
+            content,
+        })
+}
+
 fn build_atlassian_markup_parser<'a>() -> impl Parser<'a, &'a str, Vec<MarkUpNode<'a>>> {
     let heading = build_atlassian_markup_heading_parser();
     heading.repeated().collect()
@@ -219,13 +332,13 @@ mod tests {
     }
 
     #[parameterized(
-        h1 = {"h1. Some heading\n", "# Some heading\n"},
-        h2 = {"h2. Some heading\n", "## Some heading\n"},
-        h3 = {"h3. Some heading\n", "### Some heading\n"},
-        h4 = {"h4. Some heading\n", "#### Some heading\n"},
-        h5 = {"h5. Some heading\n", "##### Some heading\n"},
-        h6 = {"h6. Some heading\n", "###### Some heading\n"},
-    )]
+            h1 = {"h1. Some heading\n", "# Some heading\n"},
+            h2 = {"h2. Some heading\n", "## Some heading\n"},
+            h3 = {"h3. Some heading\n", "### Some heading\n"},
+            h4 = {"h4. Some heading\n", "#### Some heading\n"},
+            h5 = {"h5. Some heading\n", "##### Some heading\n"},
+            h6 = {"h6. Some heading\n", "###### Some heading\n"},
+        )]
     fn translates_headings(am_heading_line: &str, md_heading_line: &str) {
         let parser = transpile_atlassian_markup_to_markdown(am_heading_line);
         assert_eq!(parser, md_heading_line);
@@ -234,9 +347,9 @@ mod tests {
     #[test]
     fn parse_codeblock_all_params() {
         let markup = "{code:title=This is my title|linenumbers=true|language=python|firstline=0001|collapse=true}
-This is my code
-{code}
-";
+    This is my code
+    {code}
+    ";
         let parsed = build_code_block_parser().parse(markup).unwrap();
         assert_eq!(
             parsed,
@@ -250,9 +363,9 @@ This is my code
     #[test]
     fn parse_codeblock_with_title_language() {
         let markup = "{code:title=This|language=python}
-This is my code
-{code}
-";
+    This is my code
+    {code}
+    ";
         let parsed = build_code_block_parser().parse(markup).unwrap();
         assert_eq!(
             parsed,
@@ -266,9 +379,9 @@ This is my code
     #[test]
     fn parse_codeblock_with_language() {
         let markup = "{code:language=python}
-This is my code
-{code}
-";
+    This is my code
+    {code}
+    ";
         let parsed = build_code_block_parser().parse(markup).unwrap();
         assert_eq!(
             parsed,
@@ -282,9 +395,9 @@ This is my code
     #[test]
     fn parse_codeblock_no_params() {
         let markup = "{code}
-This is my code
-{code}
-";
+    This is my code
+    {code}
+    ";
         let parsed = build_code_block_parser().parse(markup).unwrap();
         assert_eq!(
             parsed,
@@ -293,5 +406,115 @@ This is my code
                 content: "This is my code\n",
             }
         );
+    }
+
+    #[parameterized(
+            info_no_opts = {
+                "{info}\nSome content\n{info}",
+                AdmotionKind::Info,
+                MarkUpNode::Admotion{kind: AdmotionKind::Info, title: None, show_icon: true, content: "Some content\n"}
+            },
+            info_only_title = {
+                "{info:title=My title}\nSome content\n{info}",
+                AdmotionKind::Info,
+                MarkUpNode::Admotion{kind: AdmotionKind::Info, title: Some("My title"), show_icon: true, content: "Some content\n"}
+            },
+            info_only_icon = {
+            "{info:show_icon=false}\nSome content\n{info}",
+            AdmotionKind::Info,
+            MarkUpNode::Admotion{kind: AdmotionKind::Info, title: None, show_icon: false, content: "Some content\n"}
+        },
+        info_all_opts = {
+            "{info:title=My title|show_icon=false}\nSome content\n{info}",
+            AdmotionKind::Info,
+            MarkUpNode::Admotion{kind: AdmotionKind::Info, title: Some("My title"), show_icon: false, content: "Some content\n"}
+        },
+        info_all_opts_reversed = {
+            "{info:show_icon=false|title=My title}\nSome content\n{info}",
+            AdmotionKind::Info,
+            MarkUpNode::Admotion{kind: AdmotionKind::Info, title: Some("My title"), show_icon: false, content: "Some content\n"}
+        },
+
+        warning_no_opts = {
+            "{warning}\nSome content\n{warning}",
+            AdmotionKind::Warning,
+            MarkUpNode::Admotion{kind: AdmotionKind::Warning, title: None, show_icon: true, content: "Some content\n"}
+        },
+        warning_only_title = {
+            "{warning:title=My title}\nSome content\n{warning}",
+            AdmotionKind::Warning,
+            MarkUpNode::Admotion{kind: AdmotionKind::Warning, title: Some("My title"), show_icon: true, content: "Some content\n"}
+        },
+        warning_only_icon = {
+            "{warning:show_icon=false}\nSome content\n{warning}",
+            AdmotionKind::Warning,
+            MarkUpNode::Admotion{kind: AdmotionKind::Warning, title: None, show_icon: false, content: "Some content\n"}
+        },
+        warning_all_opts = {
+            "{warning:title=My title|show_icon=false}\nSome content\n{warning}",
+            AdmotionKind::Warning,
+            MarkUpNode::Admotion{kind: AdmotionKind::Warning, title: Some("My title"), show_icon: false, content: "Some content\n"}
+        },
+        warning_all_opts_reversed = {
+            "{warning:show_icon=false|title=My title}\nSome content\n{warning}",
+            AdmotionKind::Warning,
+            MarkUpNode::Admotion{kind: AdmotionKind::Warning, title: Some("My title"), show_icon: false, content: "Some content\n"}
+        },
+
+        tip_no_opts = {
+            "{tip}\nSome content\n{tip}",
+            AdmotionKind::Tip,
+            MarkUpNode::Admotion{kind: AdmotionKind::Tip, title: None, show_icon: true, content: "Some content\n"}
+        },
+        tip_only_title = {
+            "{tip:title=My title}\nSome content\n{tip}",
+            AdmotionKind::Tip,
+            MarkUpNode::Admotion{kind: AdmotionKind::Tip, title: Some("My title"), show_icon: true, content: "Some content\n"}
+        },
+        tip_only_icon = {
+            "{tip:show_icon=false}\nSome content\n{tip}",
+            AdmotionKind::Tip,
+            MarkUpNode::Admotion{kind: AdmotionKind::Tip, title: None, show_icon: false, content: "Some content\n"}
+        },
+        tip_all_opts = {
+            "{tip:title=My title|show_icon=false}\nSome content\n{tip}",
+            AdmotionKind::Tip,
+            MarkUpNode::Admotion{kind: AdmotionKind::Tip, title: Some("My title"), show_icon: false, content: "Some content\n"}
+        },
+        tip_all_opts_reversed = {
+            "{tip:show_icon=false|title=My title}\nSome content\n{tip}",
+            AdmotionKind::Tip,
+            MarkUpNode::Admotion{kind: AdmotionKind::Tip, title: Some("My title"), show_icon: false, content: "Some content\n"}
+        },
+
+        note_no_opts = {
+            "{note}\nSome content\n{note}",
+            AdmotionKind::Note,
+            MarkUpNode::Admotion{kind: AdmotionKind::Note, title: None, show_icon: true, content: "Some content\n"}
+        },
+        note_only_title = {
+            "{note:title=My title}\nSome content\n{note}",
+            AdmotionKind::Note,
+            MarkUpNode::Admotion{kind: AdmotionKind::Note, title: Some("My title"), show_icon: true, content: "Some content\n"}
+        },
+        note_only_icon = {
+            "{note:show_icon=false}\nSome content\n{note}",
+            AdmotionKind::Note,
+            MarkUpNode::Admotion{kind: AdmotionKind::Note, title: None, show_icon: false, content: "Some content\n"}
+        },
+        note_all_opts = {
+            "{note:title=My title|show_icon=false}\nSome content\n{note}",
+            AdmotionKind::Note,
+            MarkUpNode::Admotion{kind: AdmotionKind::Note, title: Some("My title"), show_icon: false, content: "Some content\n"}
+        },
+        note_all_opts_reversed = {
+            "{note:show_icon=false|title=My title}\nSome content\n{note}",
+            AdmotionKind::Note,
+            MarkUpNode::Admotion{kind: AdmotionKind::Note, title: Some("My title"), show_icon: false, content: "Some content\n"}
+        },
+    )]
+    fn parse_info_macro(markup: &str, admotion_kind: AdmotionKind, target_node: MarkUpNode) {
+        let parsed = build_admotion_parser(admotion_kind).parse(markup).unwrap();
+        assert_eq!(parsed, target_node);
     }
 }
